@@ -1,0 +1,377 @@
+---
+title: "Combined Investment Strategy: MarketCap & Momentum"
+author: "Quentin BORNE"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+This project implements a combined investment strategy based on Market Capitalization and Returns Momentum applied to S&P 500 stocks. The goal of this strategy is to outperfom as much as possible its benchmark (the S&P500 index) over the past 15 years by actively managing a portfolio of 10 stocks from quantitative data only.<br> According to the renowned SPIVA research, only 10% of actively managed Large-Cap funds perform better than the S&P500 index over 15 years: https://www.spglobal.com/spdji/en/research-insights/spiva/.
+
+# Libraries
+
+```{r libraries}
+if (!require("rvest")) install.packages("rvest"); library(rvest)
+if (!require("dplyr")) install.packages("dplyr"); library(dplyr)
+if (!require("zoo")) install.packages("zoo"); library(zoo)
+if (!require("xts")) install.packages("xts"); library(xts)
+if (!require("PerformanceAnalytics")) install.packages("PerformanceAnalytics"); library(PerformanceAnalytics)
+if (!require("quantmod")) install.packages("quantmod"); library(quantmod)
+if (!require("ggplot2")) install.packages("ggplot2"); library(ggplot2)
+if (!require("tseries")) install.packages("tseries"); library(tseries)
+if (!require("openxlsx")) install.packages("openxlsx"); library(openxlsx)
+if (!require("readxl")) install.packages("readxl"); library(readxl)
+if (!require("lubridate")) install.packages("lubridate"); library(lubridate)
+if (!require("reshape2")) install.packages("reshape2"); library(reshape2)
+if (!require("kableExtra")) install.packages("kableExtra"); library(kableExtra)
+if (!require("knitr")) install.packages("knitr"); library(knitr)
+if (!require("tibble")) install.packages("tibble"); library(tibble)
+```
+
+# Functions
+
+This section defines a custom function `Returns.Daily()` which retrieves daily adjusted closing prices for a list of tickers from Yahoo Finance. It then computes their daily returns, removes tickers with too much missing data, and returns a clean xts object of daily returns. The same logic is followed for `Returns.Monthly()`, which is as well used for more computation efficiency.
+
+```{r functions}
+# Daily Returns
+Returns.Daily <- function(Tickers, StartDate, EndDate) {
+  PricesRead <- NULL
+
+  for (Ticker in Tickers) {
+    tickerData <- tryCatch({
+      data <- getSymbols.yahoo(Ticker, from = StartDate, to = EndDate, verbose = FALSE,
+                               auto.assign = FALSE)[,6]
+      colnames(data) <- Ticker
+      data
+    }, error = function(e) {
+      message(paste("Error retrieving data for", Ticker, "- skipping ticker."))
+      return(NULL)
+    })
+
+    if (!is.null(tickerData)) {
+      if (is.null(PricesRead)) {
+        PricesRead <- tickerData
+      } else {
+        PricesRead <- cbind(PricesRead, tickerData)
+      }
+    }
+  }
+
+  if (is.null(PricesRead) || ncol(PricesRead) == 0) {
+    message("No valid price data was retrieved for any ticker.")
+    return(NULL)
+  }
+
+  na_pct <- apply(PricesRead, 2, function(x) mean(is.na(x)))
+  PricesRead <- PricesRead[, na_pct <= 0.01]
+  Prices <- PricesRead[apply(PricesRead, 1, function(x) all(!is.na(x))), ]
+  Returns <- na.omit(Return.calculate(Prices))
+  colnames(Returns) <- gsub("\\.Adjusted", "", colnames(Returns))
+  colnames(Returns) <- gsub("\\.", "-", colnames(Returns))
+
+  return(Returns)
+}
+
+# Monthly Returns
+Returns.Monthly <- function(Tickers, StartDate, EndDate) {
+  PricesRead <- NULL
+
+  for (Ticker in Tickers) {
+    tickerData <- tryCatch({
+      data <- getSymbols.yahoo(Ticker, from = StartDate, to = EndDate,
+                               periodicity = "monthly", verbose = FALSE,
+                               auto.assign = FALSE)[,6]
+      colnames(data) <- Ticker
+      data
+    }, error = function(e) {
+      message(paste("Error retrieving data for", Ticker, "- skipping ticker."))
+      return(NULL)
+    })
+
+    if (!is.null(tickerData)) {
+      if (is.null(PricesRead)) {
+        PricesRead <- tickerData
+      } else {
+        PricesRead <- cbind(PricesRead, tickerData)
+      }
+    }
+  }
+
+  if (is.null(PricesRead) || ncol(PricesRead) == 0) {
+    message("No valid price data was retrieved for any ticker.")
+    return(NULL)
+  }
+
+  na_pct <- apply(PricesRead, 2, function(x) mean(is.na(x)))
+  PricesRead <- PricesRead[, na_pct <= 0.01]
+  Prices <- PricesRead[apply(PricesRead, 1, function(x) all(!is.na(x))), ]
+  Returns <- na.omit(Return.calculate(Prices))
+  colnames(Returns) <- gsub("\\.Adjusted", "", colnames(Returns))
+  colnames(Returns) <- gsub("\\.", "-", colnames(Returns))
+
+  return(Returns)
+}
+```
+
+# Data Collection and Preparation
+First of all, the S&P500 tickers have been scrapped from Wikipedia thanks to the `read_html()` function from the *rvest* package. This allowed to retrieve data for the Momentum strategy; Historical prices have been downloaded from yahoo finance, then have been computed into monthly returns thanks to the fine tuned function above, and the result exported into an Excel. Finally, regarding the Market Capitalization strategy, data from Bloomberg have been retrieved and then exported into an Excel (one can notice that there are earnings surprises data in this Excel as well - cf. Remarks below for explanation).
+
+```{r data-prep}
+
+# --- Data for Tickers ---
+url <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+sp500_table <- read_html(url) %>% html_node(xpath = '//*[@id="constituents"]') %>% html_table()
+tickers <- gsub("\\.", "-", sp500_table$Symbol)
+
+# --- Data for Momentum ---
+#monthly_returns_cache <- Returns.Monthly(tickers, "2009-01-01", "2024-12-31")
+#monthly_returns_df <- data.frame(Date = index(monthly_returns_cache), coredata(monthly_returns_cache))
+#write.xlsx(monthly_returns_df, "monthly_returns_cache.xlsx", rowNames = FALSE)
+monthly_returns_df <- read_excel("monthly_returns_cache.xlsx")
+monthly_returns_cache <- xts(monthly_returns_df[,-1], order.by = as.Date(monthly_returns_df$Date))
+
+# --- Data for MktCap ---
+df <- read_excel("Data_for_R.xlsx", sheet = "MarketCap values")
+MktCap_2009_2023 <- df %>% filter(Year >= 2009 & Year <= 2023)
+MktCap_2009_2023[MktCap_2009_2023 == "—"] <- "0"
+colnames(MktCap_2009_2023) <- sub(" .*", "", colnames(MktCap_2009_2023))
+colnames(MktCap_2009_2023) <- gsub("/", "-", colnames(MktCap_2009_2023))
+#write.xlsx(MktCap_2009_2023, "MktCap_2009_2023.xlsx", rowNames = FALSE)
+```
+
+# Strategy Implementation
+**For each year from 2010 to 2024 (Portfolio holding period from January 1 to December 31 of each year):**<br>
+ 1. Use previous year's MarketCap data to select top 5 tickers.<br>
+ 2. From the remaining tickers, use the previous year's monthly returns momentum 
+    (using the full previous year as the lookback period) to select top 5 tickers.<br>
+ 3. Combine these to form our Portfolio of 10 stocks.<br>
+ 4. Compute Portfolio & Benchmark performances.
+
+```{r strategy-loop}
+portfolio_years <- 2010:2024 # period of the backtesting
+portfolio_results <- list() # initialization of results
+
+for (year in portfolio_years) {
+  prev_year <- year - 1 # for the lookback period
+  
+  # --- 1. MarketCap Selection (Top 5) ---
+  market_cap_data <- MktCap_2009_2023 %>% filter(Year == prev_year)
+  if(nrow(market_cap_data) == 0){
+    message(paste("No market cap data available for", prev_year))
+    next
+  }
+  market_cap_values <- market_cap_data %>% select(-Year)
+  vals <- as.numeric(market_cap_values[1, ])
+  names(vals) <- colnames(market_cap_values)
+  sorted_cap <- sort(vals, decreasing = TRUE)
+  marketcap_top5 <- head(sorted_cap, 5)
+  marketcap_tickers <- names(marketcap_top5)
+  
+  # --- 2. Momentum Selection (Top 5 excluding MarketCap tickers) ---
+  start_prev <- paste0(prev_year, "-01-01")
+  end_prev <- paste0(prev_year, "-12-31")
+  returns_data <- monthly_returns_cache[paste0(start_prev, "/", end_prev)]
+  
+  period_returns <- apply(returns_data, 2, function(x) prod(1 + x, na.rm = TRUE) - 1)
+  momentum_returns <- period_returns[!names(period_returns) %in% marketcap_tickers]
+  if (length(momentum_returns) == 0) {
+    message(paste("No momentum data available for", prev_year))
+    next
+  }
+  sorted_mom <- sort(momentum_returns, decreasing = TRUE)
+  momentum_top5 <- head(sorted_mom, 5)
+  momentum_tickers <- names(momentum_top5)
+  
+  # --- 3. Combine to get full portfolio ---
+  portfolio_tickers <- c(marketcap_tickers, momentum_tickers)
+  
+  # --- 4. Portfolio & Benchmark Performances Calculation ---
+  start_date <- as.Date(paste0(year, "-01-01"))
+  end_date <- as.Date(paste0(year, "-12-31"))
+  
+  # Portfolio
+  portfolio_returns_data <- Returns.Daily(portfolio_tickers, as.character(start_date), as.character(end_date))
+  portfolio_daily_returns <- rowMeans(portfolio_returns_data, na.rm = TRUE)
+  n_days <- nrow(portfolio_returns_data)
+  period_portfolio_return <- prod(1 + portfolio_daily_returns) - 1
+  period_volatility <- sd(portfolio_daily_returns) * sqrt(n_days)
+  period_sharpe <- ifelse(period_volatility != 0, period_portfolio_return / period_volatility, NA)
+  
+  # Benchmark (S&P500)
+  sp500_returns_data <- Returns.Daily("^GSPC", as.character(start_date), as.character(end_date))
+  if (!is.null(sp500_returns_data) && nrow(sp500_returns_data) > 0) {
+    sp500_daily_returns <- as.numeric(sp500_returns_data)
+    sp500_period_return <- prod(1 + sp500_daily_returns) - 1
+    sp500_volatility <- sd(sp500_daily_returns) * sqrt(n_days)
+    sp500_sharpe <- ifelse(sp500_volatility != 0, sp500_period_return / sp500_volatility, NA)
+  } else {
+    sp500_period_return <- NA
+    sp500_volatility <- NA
+    sp500_sharpe <- NA
+  }
+  
+  # Save results
+  portfolio_results[[as.character(year)]] <- list(
+    tickers = portfolio_tickers,
+    portfolio = list(
+      period_return = period_portfolio_return,
+      volatility = period_volatility,
+      sharpe = period_sharpe
+    ),
+    sp500 = list(
+      period_return = sp500_period_return,
+      volatility = sp500_volatility,
+      sharpe = sp500_sharpe
+    )
+  )
+}
+```
+
+# Performance Summary
+
+Interpretation below both the table and the graph.
+
+```{r performance-summary-1}
+# Extract data into a data frame
+summary_table <- tibble::tibble(
+  Year = integer(),
+  Portfolio_Return = numeric(),
+  Portfolio_Volatility = numeric(),
+  Portfolio_Sharpe = numeric(),
+  SP500_Return = numeric(),
+  SP500_Volatility = numeric(),
+  SP500_Sharpe = numeric()
+)
+
+for (y in names(portfolio_results)) {
+  row <- portfolio_results[[y]]
+  summary_table <- rbind(summary_table, tibble::tibble(
+    Year = as.integer(y),
+    Portfolio_Return = row$portfolio$period_return,
+    Portfolio_Volatility = row$portfolio$volatility,
+    Portfolio_Sharpe = row$portfolio$sharpe,
+    SP500_Return = row$sp500$period_return,
+    SP500_Volatility = row$sp500$volatility,
+    SP500_Sharpe = row$sp500$sharpe
+  ))
+}
+
+# Round & style
+summary_table <- summary_table %>%
+  arrange(Year) %>%
+  mutate(across(-Year, ~ round(., 4)))
+
+# Format and colorize summary_table
+kable(summary_table, format = "html", caption = "Performance Metrics by Year") %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped", "hover")) %>%
+  
+  # Returns (light green)
+  column_spec(2, background = "#d4f4dd") %>%  # Portfolio Return
+  column_spec(5, background = "#d4f4dd") %>%  # SP500 Return
+  
+  # Volatility (light yellow)
+  column_spec(3, background = "#fffbe6") %>%  # Portfolio Volatility
+  column_spec(6, background = "#fffbe6") %>%  # SP500 Volatility
+  
+  # Sharpe Ratio (light blue)
+  column_spec(4, background = "#e6f7ff") %>%  # Portfolio Sharpe
+  column_spec(7, background = "#e6f7ff")      # SP500 Sharpe
+
+```
+
+**Interpretation:**<br>
+The performance table shows that the combined strategy outperformed the S&P 500 in most years between 2010 and 2024, both in terms of annual returns and Sharpe ratios. While the strategy experienced higher volatility, especially during strong growth years like 2020 and 2024, it generally delivered superior risk-adjusted performance (Sharpe ratio). Notably, even in years where market returns were low or negative (e.g., 2011 and 2018), the strategy showed resilience.
+
+```{r performance-summary-2, fig.width=20, fig.height=12, fig.align='center', out.width='100%'}
+# Extract years and portfolio returns
+years_vec <- sort(as.numeric(names(portfolio_results)))
+portfolio_period_returns <- sapply(years_vec, function(y) portfolio_results[[as.character(y)]]$portfolio$period_return)
+sp500_period_returns <- sapply(years_vec, function(y) portfolio_results[[as.character(y)]]$sp500$period_return)
+
+# Compute cumulative returns starting from $100
+portfolio_cumulative <- 100 * cumprod(1 + portfolio_period_returns)
+sp500_cumulative <- 100 * cumprod(1 + sp500_period_returns)
+
+# Combine into data frame for plotting
+plot_df <- data.frame(
+  Year = years_vec,
+  Portfolio = portfolio_cumulative,
+  SP500 = sp500_cumulative
+)
+
+# Reshape for ggplot
+plot_df_long <- melt(plot_df, id.vars = "Year", variable.name = "Strategy", value.name = "Cumulative_Value")
+
+# Get terminal values for labels
+index_2024 <- which(years_vec == 2024)
+portfolio_terminal <- portfolio_cumulative[index_2024]
+sp500_terminal <- sp500_cumulative[index_2024]
+
+terminal_labels <- data.frame(
+  Year = 2024,
+  Strategy = c("Portfolio", "SP500"),
+  Cumulative_Value = c(portfolio_terminal, sp500_terminal),
+  Label = sprintf("%.2f", c(portfolio_terminal, sp500_terminal))
+)
+
+# Plot
+ggplot(plot_df_long, aes(x = Year, y = Cumulative_Value, color = Strategy)) +
+  geom_line(size = 1.4) +
+  geom_point(size = 3) +
+  geom_text(data = terminal_labels, 
+            aes(label = Label), 
+            nudge_x = 0.5, 
+            size = 6, 
+            fontface = "bold", 
+            show.legend = FALSE) +
+  scale_x_continuous(
+    limits = c(min(years_vec), 2025),
+    breaks = seq(min(years_vec), 2024, 2)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 3000, by = 500),
+    limits = c(0, 3000)
+  ) +
+  labs(
+    title = paste("Cumulative Performance (Investing $100 in", years_vec[1], ")"),
+    subtitle = "Combined Strategy: MarketCap (Top 5) + Momentum (Top 5) vs S&P 500",
+    x = "Year",
+    y = "Cumulative Value of $100"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 40, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 30, hjust = 0),
+    axis.title = element_text(size = 30),
+    axis.text = element_text(size = 28),
+    legend.title = element_text(size = 28),
+    legend.text = element_text(size = 28),
+    plot.margin = margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+```
+**Interpretation:**<br>
+The cumulative performance plot highlights the significant long-term outperformance of the combined MarketCap + Momentum strategy compared to the S&P 500 benchmark. Starting from $100 dollars in 2010, the strategy grew to over 2800 dollars by 2024, while the S&P 500 reached just under 500 dollars. This illustrates the compounded advantage of factor-based investing over time, despite occasional drawdowns and volatility.
+
+
+# Remarks
+
+It is important to notice that this implementation does not take into account the fees of transaction of our Portfolio that are, by nature of the strategy, more important than our benchmark. Therefore, the Portfolio's performance should be slightly lower compared to the S&P500.<br><br>
+Moreover, three other strategies have been considered in order to improve the Portfolio's performance (and even tested for two of them). 1st considered: Computing optimal weights from past returns but it was not improving the performance. 2nd considered: Adding the Earnings Surprises Momentum (but reached the Bloomberg data retrieving limit and stopped there). 3rd considered: Tried to add the Piotroski F-Score as a quality filter for the momentum stock selection (retrieved a lot of financials data from Alpha Vintage premium API) but way too much data was missing before 2021, and doing that from 2021 was not improve the performance.
+
+
+# Sources
+
+Stack Overflow, GitHub and LLMs such as ChatGPT & Grok (by taking care of using them as tools and not copy pasting without thinking/understanding).
+
+
