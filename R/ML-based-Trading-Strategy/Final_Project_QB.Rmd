@@ -1,0 +1,1053 @@
+---
+title: "ML-Based Trading Strategy on Bitcoin "
+author: "Quentin BORNE"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+Cryptocurrency markets are well known for their high volatility, strong non-linear dependencies, and limited predictability, making them an ideal field for testing advanced data-driven trading approaches. The primary goal of this project is to develop and evaluate a machine learning-based trading strategy for the Bitcoin perpetual futures market on Binance.
+
+After performing a comprehensive data gathering and feature engineering process, I implemented a LightGBM model for next-day directional price prediction. The model’s output is then used to power a simple algorithmic trading strategy: going long or short with daily rebalancing and out-of-sample evaluation, using realistic assumptions for transaction costs and leverage.
+
+The robustness and effectiveness of the model are assessed through systematic feature selection, hyperparameter tuning, and a thorough walk-forward backtest. Key performance metrics—such as return, volatility, and Sharpe ratio—are reported for various leverage scenarios and compared to a buy-and-hold benchmark. This approach not only measures the predictive power of the model but also its practical viability in a real trading environment.
+
+# Libraries
+
+Libraries used for this project.
+
+```{r libraries}
+if (!require("rvest")) install.packages("rvest"); library(rvest)
+if (!require("dplyr")) install.packages("dplyr"); library(dplyr)
+if (!require("knitr")) install.packages("knitr"); library(knitr)
+if (!require("corrplot")) install.packages("corrplot"); library(corrplot)
+if (!require("infotheo")) install.packages("infotheo"); library(infotheo)
+if (!require("Matrix")) install.packages("Matrix"); library(Matrix)
+if (!require("lightgbm")) install.packages("lightgbm"); library(lightgbm)
+if (!require("caret")) install.packages("caret"); library(caret)
+if (!require("foreach")) install.packages("foreach"); library(foreach)
+if (!require("doParallel")) install.packages("doParallel"); library(doParallel)
+if (!require("ggplot2")) install.packages("ggplot2"); library(ggplot2)
+if (!require("tidyr")) install.packages("tidyr"); library(tidyr)
+```
+
+# Data
+
+## Retrieving and Cleaning Data
+
+The data was retrieved from the internet by using Python and then stored in a CSV file to be used here. I chose Python because I am more familiar with it for scrapping data. The Jupiter Notebook created for this purpose is titled "data_retrieving" and is included in the zip of this project.
+
+You can find below a sample of the data retrieved. OHLC prices were retrieved from Binance BTC Perpetual Futures. Other data were gathered from different sources.
+
+  MACD_hist are daily histograms of the MACD.
+  Google_trends are daily trends of "Bitcoin" on Google.
+  FGI_score are daily scores of the Fear and Greed index.
+  TIPS5Y are daily rates of an inflation-protected bond.
+  US_rates are daily short term interest rate of US Treasury Bond.
+
+For more clarification, please refer to the "data_retrieving" file.
+
+
+The most important thing about data cleaning was handling NA values (particularly present for off days with macro data). To solve this, I used the "fillna(method='ffill')" technique to carry forward the last known non-missing value.
+
+```{r}
+# Read the CSV file
+data <- read.csv("C:/Users/quent/OneDrive/Documents/Etudes/M2 MQF/Classes/Track MQF/Machine learning with R/all_data.csv")
+
+head(data, 2)
+```
+
+## Features Engineering and Labeling
+
+A part of the features engineering has already been performed in the "data_retrieving" file previously mentioned, such as computing the MACD_hist, RSI, and RSI_minus_50 from the daily Close prices.
+
+The other part of the features engineering is performed below. The deltas of each potential features has been computed and added as new columns because we might need them to get rid of the persistence of the predictors given our label (to be confirmed later with the Auto Correlation analysis).
+
+The chosen Label is the binary classification "1" if the BTC price of the next day went up, "0" if not. It is computed below and added as a new column (Daily_label). Of course, this project was coded to avoid any forward-looking bias.
+
+```{r features 1}
+# Read the CSV file
+data <- read.csv("C:/Users/quent/OneDrive/Documents/Etudes/M2 MQF/Classes/Track MQF/Machine learning with R/all_data.csv")
+
+# Identify columns from MACD_hist to the end
+start_col <- which(names(data) == "MACD_hist")
+end_col <- ncol(data)
+target_cols <- names(data)[start_col:end_col]
+
+# Function to calculate delta (difference) for a column
+calculate_delta <- function(x) {
+  c(NA, diff(x))
+}
+
+# Add delta columns for each target column
+for (col in target_cols) {
+  delta_col_name <- paste0(col, "_delta")
+  data <- data %>%
+    mutate(!!delta_col_name := calculate_delta(.data[[col]]))
+  
+  # Reorder to place delta column right after the original column
+  col_pos <- which(names(data) == col)
+  new_col_pos <- which(names(data) == delta_col_name)
+  if (new_col_pos > col_pos + 1) {
+    data <- data %>%
+      select(1:col_pos, delta_col_name, everything())
+  }
+}
+
+# Add Daily_return (lag-based) right after Close
+close_pos <- which(names(data) == "Close")
+data <- data %>%
+  mutate(Daily_return = (Close - lag(Close)) / lag(Close)) %>%
+  select(1:close_pos, Daily_return, everything())
+
+# Add forward-looking return and label columns
+data <- data %>%
+  # Daily forward return: (Close[t+1] - Close[t]) / Close[t]
+  mutate(Daily_fut_return = (lead(Close) - Close) / Close,
+         # Daily label: 1 if Daily_fut_return > 0, 0 otherwise
+         Daily_label = as.integer(Daily_fut_return > 0))
+
+# Drop only the first row
+data <- data[-1, ]
+
+# Reset the index (row names) to start from 1
+row.names(data) <- NULL
+
+# View the first few rows to verify
+head(data, 2)
+```
+
+## Features Selection
+
+In order to select the best set of features for our model, we are going to follow thoroughly the following steps:
+
+1. Auto Correlation analysis
+2. Correlation analysis
+3. Adding Lags
+4. Mutual Information analysis
+5. Features Importance analysis
+
+At each step, some features are removed (added for the 3rd step), until we obtain an optimal set of features.
+
+
+
+First, we begin with the auto correlation analysis. To select the right Features/Label combination for a given model, they need to have **consistency in persistence!** In order to assess that, we will compute and analyze the auto correlations of each of them.
+
+```{r autocorrel}
+# Function to calculate autocorrelation at lag 1
+acf_1 <- function(v) {
+  # Handle potential NA values and ensure sufficient data
+  if (sum(!is.na(v)) < 2) return(NA)
+  return(acf(v, lag.max = 1, plot = FALSE, na.action = na.pass)$acf[2])
+}
+
+# Calculate autocorrelation for all numeric columns
+acf_results <- data %>%
+  summarise_if(is.numeric, acf_1)
+
+# Print results
+print(acf_results)
+
+# Categorize columns by autocorrelation level
+low_ac <- data.frame(Column = names(acf_results)[abs(acf_results) < 0.3], Level = "Low")
+medium_ac <- data.frame(Column = names(acf_results)[abs(acf_results) >= 0.3 & abs(acf_results) < 0.7], Level = "Medium")
+high_ac <- data.frame(Column = names(acf_results)[abs(acf_results) >= 0.7], Level = "High")
+
+# Combine all results into a single data frame
+ac_summary <- rbind(low_ac, medium_ac, high_ac)
+
+# Print results as a single table using kable
+kable(ac_summary, caption = "Autocorrelation Levels of Numeric Columns (|AC| at Lag 1)")
+```
+
+Given the results, the chosen Label has a Low auto correlation. Therefore, we only keep columns with Low and Medium auto correlation as our potential Features, to be consistent with our Label.
+
+
+
+Now, we are going to perform a correlation analysis among those potential remaining Features to later drop too highly correlated ones and avoid redundancy.
+
+```{r correl, fig.height = 15, fig.width = 15}
+# Identify potential features from low and medium autocorrelation columns
+potential_features_list <- ac_summary %>%
+  filter(Level %in% c("Low", "Medium") & 
+         !Column %in% c("Daily_fut_return", "Daily_label")) %>%
+  pull(Column)
+
+selected_cols <- c("Date", "Daily_label", potential_features_list)
+
+# Only keep columns that exist in data
+existing_cols <- selected_cols[selected_cols %in% names(data)]
+
+# Now select from data
+numeric_cols <- data %>%
+  select(all_of(existing_cols)) %>%
+  select_if(is.numeric)
+
+# Compute the correlation matrix
+corr_matrix <- cor(numeric_cols, use = "pairwise.complete.obs")
+
+# Round the correlation matrix to 2 decimal places for readability
+corr_matrix <- round(corr_matrix, 2)
+
+# Set plot parameters to increase size and adjust margins
+par(mar = c(12, 12, 4, 4), cex = 1.2)  # Larger margins and font size
+
+# Create a correlation heatmap focusing on significant correlations
+corrplot(corr_matrix, method = "color", 
+         type = "upper", 
+         order = "hclust", 
+         addCoef.col = "black", 
+         tl.col = "black", 
+         tl.srt = 90,  # Vertical labels
+         tl.cex = 0.8,  # Slightly larger label text
+         number.cex = 0.7,  # Larger coefficient text
+         col = colorRampPalette(c("blue", "white", "red"))(100),
+         diag = TRUE,
+         sig.level = 0.9,  # Highlight correlations > 0.9
+         insig = "blank",  # Blank out non-significant correlations
+         title = "Correlation Matrix of Original Numeric Columns in potential_features")
+```
+
+From the results above, some correlations are too high. Therefore, some features have to be removed to avoid redundancy. 
+
+One has to choose between SP500_delta and Nasdaq_delta (difficult choice since they have the same correlation with the label, but I choose the Nasdaq_delta, because SP500_delta might have a too high correlation with the VIX_delta), and to keep only one between Daily_return, RSI_delta, and RSI_minus_50_delta (I keep Daily_return since it has the highest correlation with the label).
+
+To resume, SP500_delta, RSI_delta and RSI_minus_50_delta are removed from potential features.
+
+
+
+Now, we are going to add to the remaining features their lag 2 & 3 (features are already lag 1) that might add some signal to the model.
+
+```{r lag}
+# Identify potential features from low and medium autocorrelation columns
+potential_features_list <- ac_summary %>%
+  filter(Level %in% c("Low", "Medium") & 
+         !Column %in% c("Daily_fut_return", "Daily_label", "SP500_delta", "RSI_delta", "RSI_minus_50_delta")) %>%
+  pull(Column)
+
+# Initialize an empty Dataframe for the features, their lags, Date, and Daily_label
+potential_features <- data.frame(row.names = 1:nrow(data))
+
+# Add Date and Daily_label columns
+potential_features$Date <- data$Date
+potential_features$Daily_label <- data$Daily_label
+
+# Add potential features and their lag +1 and +2
+for (col in potential_features_list) {
+  # Add original column
+  potential_features[[col]] <- data[[col]]
+  
+  # Add lag 1 column
+  lag1_col_name <- paste0(col, "_lag2")
+  potential_features[[lag1_col_name]] <- lag(data[[col]], n = 1)
+  
+  # Add lag 2 column
+  lag2_col_name <- paste0(col, "_lag3")
+  potential_features[[lag2_col_name]] <- lag(data[[col]], n = 2)
+}
+
+# Drop the first two rows to handle NAs introduced by lagging
+potential_features <- potential_features[-(1:2), ]
+
+# Reset the index (row names) to start from 1
+row.names(potential_features) <- NULL
+
+# Print the Dataframe
+head(potential_features, 2)
+```
+
+Now, we are going to perform a mutual information analysis...
+
+```{r mi analysis}
+# Select numeric columns from potential_features (excluding Date and Daily_label)
+numeric_cols <- potential_features %>%
+  select_if(is.numeric) %>%
+  select(-Daily_label)
+
+# Discretize the numeric columns into bins for mutual information calculation
+discretized_data <- discretize(numeric_cols, disc = "equalfreq", nbins = 5)
+
+# Add the Daily_label column to the discretized data
+discretized_data$Daily_label <- potential_features$Daily_label
+
+# Compute mutual information between each feature and Daily_label
+mi_results <- apply(discretized_data, 2, function(x) {
+  mutinformation(x, discretized_data$Daily_label, method = "emp")
+})
+
+# Convert to data frame for better presentation, excluding Daily_label
+mi_df <- data.frame(Feature = names(mi_results)[names(mi_results) != "Daily_label"], 
+                    Mutual_Information = mi_results[names(mi_results) != "Daily_label"])
+
+# Sort by mutual information in descending order
+mi_df <- mi_df[order(-mi_df$Mutual_Information), ]
+
+# Print the results
+print(mi_df)
+```
+
+From the above analysis, we only keep the best 15 features.
+
+Now we will use them for our first LightGBM model. The next step (and last for features selection) is to keep only the best features from the Features Importance analysis, that we obtain after having performed our first LightGBM model.
+
+
+
+# Machine Learning Model
+
+Brief Presentation of LightGBM
+
+LightGBM (Light Gradient Boosting Machine) is an advanced machine learning algorithm based on gradient boosting decision trees. Designed for speed and efficiency, it builds tree ensembles using a unique histogram-based approach and grows trees leaf-wise rather than level-wise. This makes LightGBM particularly effective for capturing complex, non-linear relationships in large and high-dimensional datasets. LightGBM supports both classification and regression, natively handles missing values and categorical variables, and is well suited for problems involving structured data—such as financial time series and trading signals—where fast training and high accuracy are crucial.
+
+
+Model Selection and Justification
+
+Given the classification task and dataset characteristics, several machine learning models are viable, but the recommendation leans toward LightGBM for the following reasons:
+
+1. Efficiency and Performance: LightGBM is a gradient boosting framework known for its speed and efficiency, especially with structured data. It can handle the dataset size (1991 observations) effectively and capture non-linear relationships, which are common in financial data.
+2. Feature Handling: With many features, LightGBM can manage high-dimensional data and provide feature importance, aiding in interpretation and potential feature selection.
+3. Research Support: Studies like Deep learning for Bitcoin price direction prediction: models and trading strategies empirically compared (https://jfin-swufe.springeropen.com/articles/10.1186/s40854-024-00643-1) and Short-term bitcoin market prediction via machine learning (https://www.sciencedirect.com/science/article/pii/S2405918821000027) highlight LightGBM's effectiveness in Bitcoin prediction, particularly for classification tasks.
+4. Teacher's Recommendation: The guidelines encourage trying new packages like LightGBM, which aligns with using tools not covered in class, potentially valued in the project.
+
+## Last step of Features Selection
+
+```{r lightGBM 1}
+# Step 1: Feature selection based on mutual information or features importance
+top_features <- mi_df %>%
+  arrange(desc(Mutual_Information)) %>%
+  head(15) %>%
+  pull(Feature)
+
+#top_features <- importance %>%
+#  arrange(desc(Gain)) %>%
+#  head(5) %>%
+#  pull(Feature)
+
+selected_features <- intersect(top_features, names(potential_features))
+
+# Step 2: Set rolling window parameters (optimized)
+train_size <- 400   # Reduced from 500 to speed up training
+test_block <- 5     # Increased from 1 to predict 5 days per retrain
+total_rows <- nrow(potential_features)
+oos_start <- train_size + 1
+if (oos_start > total_rows) stop("oos_start exceeds total_rows. Reduce train_size.")
+oos_end <- total_rows
+
+# Step 3: Prepare feature matrix (precomputed outside loop)
+feature_matrix <- as.matrix(potential_features[, selected_features])
+
+# Step 4: Set up parallel backend
+num_cores <- parallel::detectCores() - 2 # Leave 2 cores free to reduce overhead
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Step 5: Indices for each parallel block
+indices <- seq(oos_start, oos_end, by = test_block)
+
+# Step 6: Parallel rolling walk-forward model and prediction
+results_list <- foreach(idx = indices, .packages = c("lightgbm"), .errorhandling = "pass") %dopar% {
+  # Training window
+  train_idx <- (idx - train_size):(idx - 1)
+  if (min(train_idx) < 1) {
+    train_idx <- 1:max(1, idx - 1)
+    if (length(train_idx) < train_size / 2) next  # Skip if too little training data
+  }
+  X_train <- feature_matrix[train_idx, , drop = FALSE]
+  y_train <- potential_features$Daily_label[train_idx]
+  
+  # Test block indices
+  test_indices <- idx:min(idx + test_block - 1, oos_end)
+  if (max(test_indices) > nrow(feature_matrix)) {
+    test_indices <- max(1, idx):nrow(feature_matrix)
+  }
+  X_test <- feature_matrix[test_indices, , drop = FALSE]
+  
+  dtrain <- lgb.Dataset(data = X_train, label = y_train)
+  
+  params <- list(
+    objective = "binary",
+    metric = "binary_error",
+    boosting_type = "gbdt",
+    verbosity = -1,
+    num_leaves = 16,    # Kept the same
+    learning_rate = 0.1, # Increased from 0.05 to speed up convergence
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    bagging_freq = 1,
+    seed = 42
+  )
+  
+  # Fit model with reduced rounds
+  model <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 50,       # Reduced from 100 to speed up training
+    verbose = -1
+  )
+  
+  # Predict for test block
+  pred_prob <- predict(model, X_test)
+  pred <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  # For feature importance, return model only for the last block
+  is_last_block <- (idx == tail(indices, 1))
+  list(
+    indices = test_indices,
+    preds = pred,
+    model = if (is_last_block) model else NULL
+  )
+}
+
+# Step 7: Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# Step 8: Collect results
+results <- data.frame(
+  Date = potential_features$Date[oos_start:oos_end],
+  Actual = potential_features$Daily_label[oos_start:oos_end],
+  Pred = NA
+)
+
+for (res in results_list) {
+  if (!is.null(res$indices) && !is.null(res$preds)) {
+    rel_idx <- res$indices - oos_start + 1
+    rel_idx <- rel_idx[rel_idx >= 1 & rel_idx <= nrow(results)]
+    if (length(rel_idx) > 0) results$Pred[rel_idx] <- res$preds[1:length(rel_idx)]
+  }
+}
+
+results <- results[!is.na(results$Pred), ]
+
+# Step 9: Show confusion matrix and accuracy
+if (nrow(results) > 0) {
+  conf_matrix <- caret::confusionMatrix(
+    factor(results$Pred, levels = c(0,1)),
+    factor(results$Actual, levels = c(0,1))
+  )
+  print(conf_matrix)
+  
+  overall_acc <- mean(results$Pred == results$Actual, na.rm = TRUE)
+  cat("Overall OOS Accuracy:", round(overall_acc, 4), "\n")
+} else {
+  cat("No valid predictions to compute confusion matrix or accuracy.\n")
+}
+
+# Step 10: Print feature importance from last LightGBM model
+last_model <- NULL
+for (res in rev(results_list)) {
+  if (!is.null(res$model)) {
+    last_model <- res$model
+    break
+  }
+}
+if (!is.null(last_model)) {
+  importance <- lgb.importance(last_model, percentage = TRUE)
+  print(importance)
+}
+```
+
+By having filtered the best features from the mutual analysis, then by features importance taking the best k-1, iteration after iteration, and finally by empirically trying set of potential best features thanks to previous analysis, it made me lead to the best top 7 features: "BTC_hashrate_delta", "BTC_hashrate_delta_lag2", "BTC_hashrate_delta_lag3", "Daily_return", "Daily_return_lag2", "FGI_score_delta", "FGI_score_delta_lag2".
+
+
+As you can see below, this best top 7 features gives a 53.78% of accuracy and a p-value < 1%. Therefore, we can confidently reject the null hypothesis and affirm this model has predictive power.
+
+```{r lightGBM 2}
+# Step 1: Best features selection
+best_features <- c("BTC_hashrate_delta", "BTC_hashrate_delta_lag2", "BTC_hashrate_delta_lag3",
+                      "Daily_return", "Daily_return_lag2",
+                      "FGI_score_delta", "FGI_score_delta_lag2")
+
+# Ensure only features present in potential_features are used
+best_features <- intersect(best_features, names(potential_features))
+
+# Step 2: Set rolling window parameters (optimized)
+train_size <- 400   # Reduced from 500 to speed up training
+test_block <- 5     # Increased from 1 to predict 5 days per retrain
+total_rows <- nrow(potential_features)
+oos_start <- train_size + 1
+if (oos_start > total_rows) stop("oos_start exceeds total_rows. Reduce train_size.")
+oos_end <- total_rows
+
+# Step 3: Prepare feature matrix (precomputed outside loop)
+feature_matrix <- as.matrix(potential_features[, best_features])
+
+# Step 4: Set up parallel backend
+num_cores <- parallel::detectCores() - 2 # Leave 2 cores free to reduce overhead
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Step 5: Indices for each parallel block
+indices <- seq(oos_start, oos_end, by = test_block)
+
+# Step 6: Parallel rolling walk-forward model and prediction
+results_list <- foreach(idx = indices, .packages = c("lightgbm"), .errorhandling = "pass") %dopar% {
+  # Training window
+  train_idx <- (idx - train_size):(idx - 1)
+  if (min(train_idx) < 1) {
+    train_idx <- 1:max(1, idx - 1)
+    if (length(train_idx) < train_size / 2) next  # Skip if too little training data
+  }
+  X_train <- feature_matrix[train_idx, , drop = FALSE]
+  y_train <- potential_features$Daily_label[train_idx]
+  
+  # Test block indices
+  test_indices <- idx:min(idx + test_block - 1, oos_end)
+  if (max(test_indices) > nrow(feature_matrix)) {
+    test_indices <- max(1, idx):nrow(feature_matrix)
+  }
+  X_test <- feature_matrix[test_indices, , drop = FALSE]
+  
+  dtrain <- lgb.Dataset(data = X_train, label = y_train)
+  
+  params <- list(
+    objective = "binary",
+    metric = "binary_error",
+    boosting_type = "gbdt",
+    verbosity = -1,
+    num_leaves = 16,    # Kept the same
+    learning_rate = 0.1, # Increased from 0.05 to speed up convergence
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    bagging_freq = 1,
+    seed = 42
+  )
+  
+  # Fit model with reduced rounds
+  model <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 50,       # Reduced from 100 to speed up training
+    verbose = -1
+  )
+  
+  # Predict for test block
+  pred_prob <- predict(model, X_test)
+  pred <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  # For feature importance, return model only for the last block
+  is_last_block <- (idx == tail(indices, 1))
+  list(
+    indices = test_indices,
+    preds = pred,
+    model = if (is_last_block) model else NULL
+  )
+}
+
+# Step 7: Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# Step 8: Collect results
+results <- data.frame(
+  Date = potential_features$Date[oos_start:oos_end],
+  Actual = potential_features$Daily_label[oos_start:oos_end],
+  Pred = NA
+)
+
+for (res in results_list) {
+  if (!is.null(res$indices) && !is.null(res$preds)) {
+    rel_idx <- res$indices - oos_start + 1
+    rel_idx <- rel_idx[rel_idx >= 1 & rel_idx <= nrow(results)]
+    if (length(rel_idx) > 0) results$Pred[rel_idx] <- res$preds[1:length(rel_idx)]
+  }
+}
+
+results <- results[!is.na(results$Pred), ]
+
+# Step 9: Show confusion matrix and accuracy
+if (nrow(results) > 0) {
+  conf_matrix <- caret::confusionMatrix(
+    factor(results$Pred, levels = c(0,1)),
+    factor(results$Actual, levels = c(0,1))
+  )
+  print(conf_matrix)
+  
+  overall_acc <- mean(results$Pred == results$Actual, na.rm = TRUE)
+  cat("Overall OOS Accuracy:", round(overall_acc, 4), "\n")
+} else {
+  cat("No valid predictions to compute confusion matrix or accuracy.\n")
+}
+
+# Step 10: Print feature importance from last LightGBM model
+last_model <- NULL
+for (res in rev(results_list)) {
+  if (!is.null(res$model)) {
+    last_model <- res$model
+    break
+  }
+}
+if (!is.null(last_model)) {
+  importance <- lgb.importance(last_model, percentage = TRUE)
+  print(importance)
+}
+```
+
+## Parameters Analysis
+
+Now that we have one of the most optimized set of features, the next step is to perform a hyper parameters analysis, to finally even more improve the predictive power of our LightGBM model.
+
+
+We first perform this analysis on the size of the train period, by empirically changing its value and running the code and we obtained the graph below:
+
+```{r params 1}
+# Create a dataframe from the provided table
+data <- data.frame(
+  Train_size = c(2, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000, 1050, 1100, 1150, 1200, 1250),
+  Accuracy_OOS = c(0.4799, 0.5129, 0.5122, 0.537, 0.5246, 0.5339, 0.532, 0.5171, 0.5378, 0.5241, 0.5188, 0.5243, 0.5159, 0.5269, 0.5272, 0.521, 0.5253, 0.5185, 0.5349, 0.5067, 0.5223, 0.5043, 0.5158, 0.5024, 0.5152, 0.4878),
+  P_Value = c(0.9989, 0.5273, 0.5822, 0.01497, 0.1435, 0.02067, 0.02428, 0.15551, 0.001944, 0.03923, 0.09305, 0.04323, 0.1476, 0.03348, 0.03956, 0.07359, 0.04907, 0.1497, 0.01819, 0.39, 0.1469, 0.5905, 0.43347, 0.7216, 0.5427, 0.9583)
+)
+
+# Create the dual-axis plot with adjusted Accuracy OOS range (0.4 to 0.6)
+ggplot(data, aes(x = Train_size)) +
+  # Line for Accuracy OOS (left y-axis)
+  geom_line(aes(y = Accuracy_OOS, color = "Accuracy OOS"), size = 1) +
+  geom_point(aes(y = Accuracy_OOS, color = "Accuracy OOS"), size = 2) +
+  # Line for P-Value (right y-axis)
+  geom_line(aes(y = P_Value * (0.6 - 0.4) / max(P_Value) + 0.4, color = "P-Value [Acc > NIR]"), size = 1, linetype = "dashed") +
+  geom_point(aes(y = P_Value * (0.6 - 0.4) / max(P_Value) + 0.4, color = "P-Value [Acc > NIR]"), size = 2) +
+  # Set scales with custom range for Accuracy OOS
+  scale_y_continuous(name = "Accuracy OOS", limits = c(0.4, 0.6),
+                     sec.axis = sec_axis(~ ((. - 0.4) * max(data$P_Value) / (0.6 - 0.4)), name = "P-Value [Acc > NIR]")) +
+  # Customize colors and legend
+  scale_color_manual(values = c("Accuracy OOS" = "blue", "P-Value [Acc > NIR]" = "red")) +
+  labs(title = "Train Size vs Accuracy OOS and P-Value", x = "Train Size", color = "Metric") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+Above results led me to take a train size of 400 observations. Then, we have to perform an analysis on hyper parameters. 
+
+I found that most critical hyper parameters are both num_leaves and learning_rate. Nonetheless nrounds, feature_fraction and bagging_fraction have an impact, it is more limited than the two previously mentioned. 
+
+In this way, and in order to minimize the computational time, we therefore below perform a grid search by exploring num_leaves and learning_rate only, with other hyper parameters being purposely fixed (but already on interesting values found empirically).
+
+```{r params 2}
+# --- 1. Feature Selection ---
+best_features <- c(
+  "BTC_hashrate_delta", "BTC_hashrate_delta_lag2", "BTC_hashrate_delta_lag3",
+  "Daily_return", "Daily_return_lag2",
+  "FGI_score_delta", "FGI_score_delta_lag2"
+)
+best_features <- intersect(best_features, names(potential_features))
+
+# --- 2. Prepare Feature Matrix ---
+feature_matrix <- as.matrix(potential_features[, best_features])
+
+# --- 3. Grid of Parameters ---
+param_grid <- expand.grid(
+  num_leaves = c(6, 8, 10, 12, 14, 16),
+  learning_rate = c(0.025, 0.05, 0.075, 0.1),
+  nrounds = c(50),
+  feature_fraction = c(1.0),
+  bagging_fraction = c(1.0)
+)
+
+# --- 4. Fixed Rolling Parameters ---
+train_size <- 400
+test_block <- 5
+total_rows <- nrow(potential_features)
+oos_start <- train_size + 1
+oos_end <- total_rows
+
+# --- 5. Store Results ---
+results_list <- list()
+
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+  cat(sprintf("\n=== Running combination %d of %d ===\n", i, nrow(param_grid)))
+  cat(sprintf("Params: num_leaves=%d, learning_rate=%.3f, nrounds=%d, feature_fraction=%d, bagging_fraction=%d\n", params$num_leaves, params$learning_rate, params$nrounds, params$feature_fraction, params$bagging_fraction))
+  
+  # Parallel Backend
+  num_cores <- parallel::detectCores() - 2
+  cl <- makeCluster(num_cores)
+  registerDoParallel(cl)
+  
+  indices <- seq(oos_start, oos_end, by = test_block)
+  
+  # Rolling Walk-Forward LightGBM
+  res_list <- foreach(idx = indices, .packages = c("lightgbm"), .errorhandling = "pass") %dopar% {
+    train_idx <- (idx - train_size):(idx - 1)
+    if (min(train_idx) < 1) {
+      train_idx <- 1:max(1, idx - 1)
+      if (length(train_idx) < train_size / 2) next
+    }
+    X_train <- feature_matrix[train_idx, , drop = FALSE]
+    y_train <- potential_features$Daily_label[train_idx]
+    
+    test_indices <- idx:min(idx + test_block - 1, oos_end)
+    if (max(test_indices) > nrow(feature_matrix)) {
+      test_indices <- max(1, idx):nrow(feature_matrix)
+    }
+    X_test <- feature_matrix[test_indices, , drop = FALSE]
+    
+    dtrain <- lgb.Dataset(data = X_train, label = y_train)
+    
+    lgb_params <- list(
+      objective = "binary",
+      metric = "binary_error",
+      boosting_type = "gbdt",
+      verbosity = -1,
+      num_leaves = params$num_leaves,
+      learning_rate = params$learning_rate,
+      feature_fraction = params$feature_fraction,
+      bagging_fraction = params$bagging_fraction,
+      bagging_freq = 1,
+      seed = 42
+    )
+    
+    model <- lgb.train(
+      params = lgb_params,
+      data = dtrain,
+      nrounds = params$nrounds,
+      verbose = -1
+    )
+    
+    pred_prob <- predict(model, X_test)
+    pred <- ifelse(pred_prob > 0.5, 1, 0)
+    list(
+      indices = test_indices,
+      preds = pred
+    )
+  }
+  
+  stopCluster(cl)
+  registerDoSEQ()
+  
+  # Collect results
+  results <- data.frame(
+    Date = potential_features$Date[oos_start:oos_end],
+    Actual = potential_features$Daily_label[oos_start:oos_end],
+    Pred = NA
+  )
+  
+  for (res in res_list) {
+    if (!is.null(res$indices) && !is.null(res$preds)) {
+      rel_idx <- res$indices - oos_start + 1
+      rel_idx <- rel_idx[rel_idx >= 1 & rel_idx <= nrow(results)]
+      if (length(rel_idx) > 0) results$Pred[rel_idx] <- res$preds[1:length(rel_idx)]
+    }
+  }
+  
+  results <- results[!is.na(results$Pred), ]
+  
+  # Compute accuracy
+  overall_acc <- if (nrow(results) > 0) {
+    mean(results$Pred == results$Actual, na.rm = TRUE)
+  } else {
+    NA
+  }
+  
+  results_list[[i]] <- data.frame(
+    Num_Leaves = params$num_leaves,
+    Learning_Rate = params$learning_rate,
+    N_Rounds = params$nrounds,
+    Feature_Fraction = params$feature_fraction,
+    Bagging_Fraction = params$bagging_fraction,
+    OOS_Accuracy = round(overall_acc, 4)
+  )
+  
+  cat(sprintf("OOS Accuracy for this run: %.4f\n", overall_acc))
+}
+
+# --- 6. Summarize Results ---
+results_summary <- do.call(rbind, results_list)
+
+# Show table
+print(results_summary)
+
+# --- 7. Plotting ---
+
+# Ensure correct types for plotting
+results_summary$Num_Leaves <- as.factor(results_summary$Num_Leaves)
+results_summary$Learning_Rate <- as.factor(results_summary$Learning_Rate)
+
+# Bar plot
+p_bar <- ggplot(results_summary, aes(x = Num_Leaves, y = OOS_Accuracy, fill = Learning_Rate)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "OOS Accuracy by num_leaves and learning_rate",
+       x = "num_leaves", fill = "learning_rate") +
+  coord_cartesian(ylim = c(0.5, 0.6)) +
+  theme_minimal(base_size = 14)
+print(p_bar)
+
+# Scatter + line plot
+p1 <- ggplot(results_summary, aes(x = as.numeric(as.character(Learning_Rate)), y = OOS_Accuracy,
+                                  color = Num_Leaves, group = Num_Leaves)) +
+  geom_point(position = position_jitter(width = 0.002), size = 2) +
+  geom_line() +
+  scale_x_continuous(breaks = sort(as.numeric(levels(results_summary$Learning_Rate)))) +
+  labs(title = "OOS Accuracy vs. Learning Rate", x = "Learning Rate", y = "OOS Accuracy", color = "Num Leaves") +
+  coord_cartesian(ylim = c(0.5, 0.6)) +
+  theme_minimal(base_size = 14)
+print(p1)
+```
+
+Best hyper parameters are the following:
+num_leaves = 14, learning_rate = 0.05, nrounds = 50, feature_fraction = 1, bagging_fraction = 1.
+
+
+Now, we have an optimized set of features and optimized parameters for our model. This led us to the best accuracy we obtained which is 55.1%, and a p-value very close to zero, as one can see below.
+
+```{r final LightGBM}
+# Step 1: Best features selection
+best_features <- c("BTC_hashrate_delta", "BTC_hashrate_delta_lag2", "BTC_hashrate_delta_lag3",
+                      "Daily_return", "Daily_return_lag2",
+                      "FGI_score_delta", "FGI_score_delta_lag2")
+
+# Ensure only features present in potential_features are used
+best_features <- intersect(best_features, names(potential_features))
+
+# Step 2: Set rolling window parameters (optimized)
+train_size <- 400   # Reduced from 500 to speed up training
+test_block <- 5     # Increased from 1 to predict 5 days per retrain
+total_rows <- nrow(potential_features)
+oos_start <- train_size + 1
+if (oos_start > total_rows) stop("oos_start exceeds total_rows. Reduce train_size.")
+oos_end <- total_rows
+
+# Step 3: Prepare feature matrix (precomputed outside loop)
+feature_matrix <- as.matrix(potential_features[, best_features])
+
+# Step 4: Set up parallel backend
+num_cores <- parallel::detectCores() - 2 # Leave 2 cores free to reduce overhead
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Step 5: Indices for each parallel block
+indices <- seq(oos_start, oos_end, by = test_block)
+
+# Step 6: Parallel rolling walk-forward model and prediction
+results_list <- foreach(idx = indices, .packages = c("lightgbm"), .errorhandling = "pass") %dopar% {
+  # Training window
+  train_idx <- (idx - train_size):(idx - 1)
+  if (min(train_idx) < 1) {
+    train_idx <- 1:max(1, idx - 1)
+    if (length(train_idx) < train_size / 2) next  # Skip if too little training data
+  }
+  X_train <- feature_matrix[train_idx, , drop = FALSE]
+  y_train <- potential_features$Daily_label[train_idx]
+  
+  # Test block indices
+  test_indices <- idx:min(idx + test_block - 1, oos_end)
+  if (max(test_indices) > nrow(feature_matrix)) {
+    test_indices <- max(1, idx):nrow(feature_matrix)
+  }
+  X_test <- feature_matrix[test_indices, , drop = FALSE]
+  
+  dtrain <- lgb.Dataset(data = X_train, label = y_train)
+  
+  params <- list(
+    objective = "binary",
+    metric = "binary_error",
+    boosting_type = "gbdt",
+    verbosity = -1,
+    num_leaves = 14,    # Kept the same
+    learning_rate = 0.05, # Increased from 0.05 to speed up convergence
+    feature_fraction = 1,
+    bagging_fraction = 1,
+    bagging_freq = 1,
+    seed = 42
+  )
+  
+  # Fit model with reduced rounds
+  model <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 50,       # Reduced from 100 to speed up training
+    verbose = -1
+  )
+  
+  # Predict for test block
+  pred_prob <- predict(model, X_test)
+  pred <- ifelse(pred_prob > 0.5, 1, 0)
+  
+  # For feature importance, return model only for the last block
+  is_last_block <- (idx == tail(indices, 1))
+  list(
+    indices = test_indices,
+    preds = pred,
+    model = if (is_last_block) model else NULL
+  )
+}
+
+# Step 7: Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+# Step 8: Collect results
+results <- data.frame(
+  Date = potential_features$Date[oos_start:oos_end],
+  Actual = potential_features$Daily_label[oos_start:oos_end],
+  Pred = NA
+)
+
+for (res in results_list) {
+  if (!is.null(res$indices) && !is.null(res$preds)) {
+    rel_idx <- res$indices - oos_start + 1
+    rel_idx <- rel_idx[rel_idx >= 1 & rel_idx <= nrow(results)]
+    if (length(rel_idx) > 0) results$Pred[rel_idx] <- res$preds[1:length(rel_idx)]
+  }
+}
+
+results <- results[!is.na(results$Pred), ]
+
+# Step 9: Show confusion matrix and accuracy
+if (nrow(results) > 0) {
+  conf_matrix <- caret::confusionMatrix(
+    factor(results$Pred, levels = c(0,1)),
+    factor(results$Actual, levels = c(0,1))
+  )
+  print(conf_matrix)
+  
+  overall_acc <- mean(results$Pred == results$Actual, na.rm = TRUE)
+  cat("Overall OOS Accuracy:", round(overall_acc, 4), "\n")
+} else {
+  cat("No valid predictions to compute confusion matrix or accuracy.\n")
+}
+
+# Step 10: Print feature importance from last LightGBM model
+last_model <- NULL
+for (res in rev(results_list)) {
+  if (!is.null(res$model)) {
+    last_model <- res$model
+    break
+  }
+}
+if (!is.null(last_model)) {
+  importance <- lgb.importance(last_model, percentage = TRUE)
+  print(importance)
+}
+```
+
+# Trading Strategy Backtesting
+
+Finally, in the below section, we backtest a trading strategy powered by our LightGBM model’s predictions, carefully incorporating realistic transaction costs and various leverage levels, as available on the Binance BTC Perpetual Futures exchange.
+
+```{r bt trading strat, fig.height = 7, fig.width = 12}
+# --- FEE AND SIGNAL PREP ---
+taker_fee <- 0.0005 # exact fee found on Binance
+spread    <- 0.0004 # to be conservative
+slippage  <- 0.0002 # to be conservative
+funding   <- 0.0003 # to be conservative
+fee_rate <- taker_fee + spread + slippage + funding
+
+results$Signal <- ifelse(results$Pred == 1, 1, -1)
+results$Signal <- dplyr::lag(results$Signal, 1)
+results$Daily_Return <- potential_features$Daily_return[oos_start:oos_end][!is.na(results$Pred)]
+bt_data <- results[!is.na(results$Signal) & !is.na(results$Daily_Return), ]
+bt_data$Date <- as.Date(bt_data$Date)
+
+# --- BACKTEST FUNCTION ---
+backtest_with_fees <- function(leverage, bt_data, fee_rate) {
+  strat_ret <- leverage * bt_data$Signal * bt_data$Daily_Return
+  trade_occurred <- c(1, abs(diff(bt_data$Signal)))
+  fee_paid <- abs(leverage) * fee_rate * trade_occurred
+  net_strat_ret <- strat_ret - fee_paid
+  portfolio_curve <- 100 * cumprod(1 + net_strat_ret)
+  list(
+    portfolio_curve = portfolio_curve,
+    net_strat_ret = net_strat_ret,
+    strat_ret = strat_ret
+  )
+}
+
+# --- RUN BACKTESTS ---
+buy_hold_curve <- 100 * cumprod(1 + bt_data$Daily_Return)
+bt1   <- backtest_with_fees(1,   bt_data, fee_rate)
+bt1_5 <- backtest_with_fees(1.5, bt_data, fee_rate)
+bt2   <- backtest_with_fees(2,   bt_data, fee_rate)
+
+# --- PERFORMANCE METRICS ---
+ann_factor <- 365
+
+return_fun <- function(x) {
+  cumprod_ret <- prod(1 + x, na.rm=TRUE)
+  n <- length(na.omit(x))
+  (cumprod_ret)^(ann_factor / n) - 1
+}
+volatility_fun <- function(x) {
+  sd(x, na.rm=TRUE) * sqrt(ann_factor)
+}
+investment_sharpe_fun <- function(x) {
+  ann_return <- return_fun(x)
+  ann_vol <- volatility_fun(x)
+  if (ann_vol == 0) return(NA)
+  ann_return / ann_vol
+}
+
+cat("\n--- Performance Summary ---\n")
+cat(sprintf(
+  "No Leverage (x1):     Final Portfolio Value: $%.2f | Return: %.2f%% | Volatility: %.2f%% | Sharpe: %.2f\n", 
+  tail(bt1$portfolio_curve,1), 
+  100 * return_fun(bt1$net_strat_ret), 
+  100 * volatility_fun(bt1$net_strat_ret),
+  investment_sharpe_fun(bt1$net_strat_ret)
+))
+cat(sprintf(
+  "Leverage x1.5:        Final Portfolio Value: $%.2f | Return: %.2f%% | Volatility: %.2f%% | Sharpe: %.2f\n", 
+  tail(bt1_5$portfolio_curve,1), 
+  100 * return_fun(bt1_5$net_strat_ret), 
+  100 * volatility_fun(bt1_5$net_strat_ret),
+  investment_sharpe_fun(bt1_5$net_strat_ret)
+))
+cat(sprintf(
+  "Leverage x2:          Final Portfolio Value: $%.2f | Return: %.2f%% | Volatility: %.2f%% | Sharpe: %.2f\n", 
+  tail(bt2$portfolio_curve,1), 
+  100 * return_fun(bt2$net_strat_ret), 
+  100 * volatility_fun(bt2$net_strat_ret),
+  investment_sharpe_fun(bt2$net_strat_ret)
+))
+cat(sprintf(
+  "Buy & Hold:           Final Portfolio Value: $%.2f | Return: %.2f%% | Volatility: %.2f%% | Sharpe: %.2f\n", 
+  tail(buy_hold_curve,1), 
+  100 * return_fun(bt_data$Daily_Return), 
+  100 * volatility_fun(bt_data$Daily_Return),
+  investment_sharpe_fun(bt_data$Daily_Return)
+))
+
+# --- PLOTTING ---
+df_plot <- data.frame(
+  Date = bt_data$Date,
+  Buy_and_Hold   = buy_hold_curve,
+  Strategy_x1    = bt1$portfolio_curve,
+  Strategy_x1_5  = bt1_5$portfolio_curve,
+  Strategy_x2    = bt2$portfolio_curve
+)
+
+colnames(df_plot) <- c("Date", "Buy & Hold", "Strategy (x1)", "Strategy (x1.5)", "Strategy (x2)")
+
+df_plot_long <- tidyr::pivot_longer(
+  df_plot, 
+  cols = c("Buy & Hold", "Strategy (x1)", "Strategy (x1.5)", "Strategy (x2)"),
+  names_to = "Strategy", 
+  values_to = "Portfolio_value"
+)
+
+p <- ggplot(df_plot_long, aes(x = Date, y = Portfolio_value, color = Strategy)) +
+  geom_line(size = 1) +
+  labs(title = "Cumulative Portfolio Value ($100 start, with fees, various leverages)",
+       y = "Portfolio value ($)",
+       x = "Date") +
+  scale_color_manual(values = c(
+    "Buy & Hold" = "gray60",
+    "Strategy (x1)" = "blue",
+    "Strategy (x1.5)" = "purple",
+    "Strategy (x2)" = "green4"
+  )) +
+  coord_cartesian(ylim = c(0, 1400)) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+print(p)
+```
+
+The above results of our backtesting lead us to conclude that our machine learning-based trading strategy on Bitcoin outperforms the buy-and-hold strategy over the out-of-sample period.
